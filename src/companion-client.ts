@@ -107,9 +107,20 @@ export class CompanionClient {
 }
 
 // REST API helpers for session management
+export interface SessionInfo {
+  sessionId: string;
+  state: string;
+  cwd: string;
+  createdAt: number;
+  name?: string;
+  backendType?: string;
+  cliSessionId?: string;
+  pid?: number;
+}
+
 export async function listSessions(
   host: string,
-): Promise<Array<{ session_id: string; state: string; cwd: string }>> {
+): Promise<SessionInfo[]> {
   const res = await fetch(`http://${host}/api/sessions`);
   if (!res.ok) throw new Error(`Failed to list sessions: ${res.status}`);
   return res.json();
@@ -144,4 +155,26 @@ export async function killSession(
     method: "POST",
   });
   if (!res.ok) throw new Error(`Failed to kill session: ${res.status}`);
+}
+
+export async function relaunchSession(
+  host: string,
+  sessionId: string,
+): Promise<void> {
+  const res = await fetch(
+    `http://${host}/api/sessions/${sessionId}/relaunch`,
+    { method: "POST" },
+  );
+  if (!res.ok)
+    throw new Error(`Failed to relaunch session: ${res.status}`);
+}
+
+export async function getSession(
+  host: string,
+  sessionId: string,
+): Promise<SessionInfo | null> {
+  const res = await fetch(`http://${host}/api/sessions/${sessionId}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`Failed to get session: ${res.status}`);
+  return res.json();
 }

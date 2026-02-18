@@ -11,15 +11,20 @@ import {
   Text,
   Spacer,
   Loader,
+  SelectList,
   matchesKey,
   type Component,
+  type SelectItem,
   CURSOR_MARKER,
 } from "@mariozechner/pi-tui";
 import {
   CompanionClient,
   createSession,
   listSessions,
+  getSession,
+  relaunchSession,
   type ConnectionStatus,
+  type SessionInfo,
 } from "./companion-client.ts";
 import type {
   ServerMessage,
@@ -202,45 +207,286 @@ function extractText(blocks: ContentBlock[]): string {
 
 // -- Main App ----------------------------------------------------------------
 
-async function main() {
-  const host = process.env.COMPANION_HOST ?? "localhost:3456";
-  const sessionArg = process.argv[2];
+// -- CLI Args ----------------------------------------------------------------
 
-  // Resolve or create session
+interface CliArgs {
+  continue: boolean;
+  resume: boolean;
+  resumeId?: string;
+  help: boolean;
+  host: string;
+}
+
+function parseCliArgs(): CliArgs {
+  const argv = process.argv.slice(2);
+  const args: CliArgs = {
+    continue: false,
+    resume: false,
+    help: false,
+    host: process.env.COMPANION_HOST ?? "localhost:3456",
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "-h" || arg === "--help") {
+      args.help = true;
+    } else if (arg === "-c" || arg === "--continue") {
+      args.continue = true;
+    } else if (arg === "-r" || arg === "--resume") {
+      args.resume = true;
+      // Peek at next arg: if it exists and doesn't start with -, it's the session ID
+      const next = argv[i + 1];
+      if (next && !next.startsWith("-")) {
+        args.resumeId = next;
+        i++;
+      }
+    } else if (arg === "--host") {
+      const next = argv[++i];
+      if (!next) {
+        console.error(chalk.red("--host requires a value"));
+        process.exit(1);
+      }
+      args.host = next;
+    } else {
+      console.error(chalk.red(`Unknown argument: ${arg}`));
+      printUsage();
+      process.exit(1);
+    }
+  }
+  return args;
+}
+
+function printUsage(): void {
+  console.log(`${chalk.bold("ccpi")} — TUI client for Claude Code via Companion
+
+${chalk.dim("Usage:")}
+  ccpi                         Connect to a running session, or create one
+  ccpi -c                      Resume the most recent session (relaunch if exited)
+  ccpi -r                      Pick a session to resume interactively
+  ccpi -r <session-id>         Resume a specific session by ID (prefix match)
+
+${chalk.dim("Options:")}
+  -c, --continue               Resume the most recent session
+  -r, --resume [id]            Resume a session (interactive picker if no ID)
+  -h, --help                   Show this help
+  --host <host:port>           Companion server (default: localhost:3456)
+`);
+}
+
+// -- Session Resolution ------------------------------------------------------
+
+function isAlive(s: SessionInfo): boolean {
+  return s.state === "connected" || s.state === "running" || s.state === "idle";
+}
+
+async function ensureAlive(
+  host: string,
+  session: SessionInfo,
+): Promise<void> {
+  if (isAlive(session)) return;
+  console.log(
+    chalk.dim(`Session ${session.sessionId.slice(0, 8)} is ${session.state}, relaunching...`),
+  );
+  await relaunchSession(host, session.sessionId);
+  await new Promise((r) => setTimeout(r, 2000));
+}
+
+function findByPrefix(
+  sessions: SessionInfo[],
+  prefix: string,
+): SessionInfo | undefined {
+  const exact = sessions.find((s) => s.sessionId === prefix);
+  if (exact) return exact;
+  const matches = sessions.filter((s) => s.sessionId.startsWith(prefix));
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    console.error(chalk.red(`Ambiguous session prefix "${prefix}", matches:`));
+    for (const m of matches) {
+      console.error(chalk.dim(`  ${m.sessionId.slice(0, 8)}  ${m.state}  ${m.cwd}`));
+    }
+    process.exit(1);
+  }
+  return undefined;
+}
+
+function timeAgo(ts: number): string {
+  const seconds = Math.floor((Date.now() - ts) / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function sessionLabel(s: SessionInfo): string {
+  const stateIcon = isAlive(s) ? chalk.green("●") : chalk.dim("○");
+  const id = s.sessionId.slice(0, 8);
+  const age = s.createdAt ? timeAgo(s.createdAt) : "";
+  const title = s.name ?? s.cwd.replace(/^\/Users\/[^/]+\//, "~/");
+  return `${stateIcon} ${chalk.bold(title)}`;
+}
+
+function sessionDescription(s: SessionInfo): string {
+  // Shown dim to the right of the label; also used for type-to-filter
+  const id = s.sessionId.slice(0, 8);
+  const age = s.createdAt ? timeAgo(s.createdAt) : "";
+  return `${id} ${age}`;
+}
+
+/** Show an interactive session picker using pi-tui SelectList. */
+function pickSession(sessions: SessionInfo[]): Promise<SessionInfo | null> {
+  return new Promise((resolve) => {
+    const terminal = new ProcessTerminal();
+    const tui = new TUI(terminal);
+
+    const header = new Text(
+      chalk.bold("Select a session to resume") +
+        chalk.dim("  (type to filter, Enter to select, Esc to cancel)"),
+      1,
+      0,
+    );
+
+    // Sort most recent first
+    const sorted = [...sessions].sort(
+      (a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0),
+    );
+
+    const items: SelectItem[] = sorted.map((s) => ({
+      label: sessionLabel(s),
+      value: s.sessionId,
+      description: sessionDescription(s),
+    }));
+
+    const list = new SelectList(items, Math.min(items.length, 20), selectListTheme);
+
+    list.onSelect = (item: SelectItem) => {
+      tui.stop();
+      const session = sessions.find((s) => s.sessionId === item.value);
+      resolve(session ?? null);
+    };
+
+    list.onCancel = () => {
+      tui.stop();
+      resolve(null);
+    };
+
+    tui.addChild(header);
+    tui.addChild(new Spacer(1));
+    tui.addChild(list);
+    tui.setFocus(list);
+    tui.start();
+  });
+}
+
+// -- Main App ----------------------------------------------------------------
+
+async function main() {
+  const args = parseCliArgs();
+
+  if (args.help) {
+    printUsage();
+    process.exit(0);
+  }
+
+  const host = args.host;
+
+  // Resolve session
+  const cwd = process.cwd();
   let sessionId: string;
-  if (sessionArg) {
-    sessionId = sessionArg;
-  } else {
-    // Try to list existing sessions, pick the first running one, or create new
-    try {
-      const sessions = await listSessions(host);
-      const running = sessions.filter(
-        (s) => s.state === "running" || s.state === "idle",
+  try {
+    const allSessions = await listSessions(host);
+    // Filter to current directory for browsing/auto-selection
+    const localSessions = allSessions.filter((s) => s.cwd === cwd);
+
+    if (args.resume) {
+      if (args.resumeId) {
+        // --resume <id>: explicit ID -- search ALL sessions (user knows what they want)
+        const session = findByPrefix(allSessions, args.resumeId);
+        if (!session) {
+          console.error(
+            chalk.red(`No session found matching "${args.resumeId}"`),
+          );
+          const recent = allSessions
+            .filter((s) => s.cwd === cwd)
+            .slice(-10);
+          if (recent.length > 0) {
+            console.error(chalk.dim("Sessions in this directory:"));
+            for (const s of recent) {
+              console.error(
+                chalk.dim(
+                  `  ${s.sessionId.slice(0, 8)}  ${s.state.padEnd(10)}  ${s.name ?? s.cwd}`,
+                ),
+              );
+            }
+          }
+          process.exit(1);
+        }
+        await ensureAlive(host, session);
+        sessionId = session.sessionId;
+        console.log(
+          chalk.dim(`Resuming session ${sessionId.slice(0, 8)}...`),
+        );
+      } else {
+        // --resume (no id): interactive picker scoped to cwd
+        if (localSessions.length === 0) {
+          console.error(
+            chalk.red(`No sessions in ${cwd}`),
+          );
+          process.exit(1);
+        }
+        const picked = await pickSession(localSessions);
+        if (!picked) {
+          process.exit(0);
+        }
+        await ensureAlive(host, picked);
+        sessionId = picked.sessionId;
+      }
+    } else if (args.continue) {
+      // --continue: most recent session in this directory
+      if (localSessions.length === 0) {
+        console.error(chalk.red(`No sessions to continue in ${cwd}`));
+        process.exit(1);
+      }
+      const sorted = [...localSessions].sort(
+        (a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0),
       );
-      if (running.length > 0) {
-        sessionId = running[0]!.session_id;
+      const session = sorted[0]!;
+      await ensureAlive(host, session);
+      sessionId = session.sessionId;
+      console.log(
+        chalk.dim(
+          `Continuing session ${sessionId.slice(0, 8)}${session.name ? ` (${session.name})` : ""}...`,
+        ),
+      );
+    } else {
+      // Default: connect to a live session in this directory, or create one
+      const alive = localSessions.filter(isAlive);
+      if (alive.length > 0) {
+        sessionId = alive[0]!.sessionId;
         console.log(
           chalk.dim(
-            `Connecting to existing session ${sessionId.slice(0, 8)}...`,
+            `Connecting to session ${sessionId.slice(0, 8)}...`,
           ),
         );
       } else {
         console.log(chalk.dim("Creating new session..."));
-        const result = await createSession(host);
+        const result = await createSession(host, { cwd });
         sessionId = result.sessionId;
         console.log(
           chalk.dim(`Created session ${sessionId.slice(0, 8)}`),
         );
       }
-    } catch (e) {
-      console.error(
-        chalk.red(
-          `Cannot connect to Companion at ${host}. Is it running?`,
-        ),
-      );
-      console.error(chalk.dim(`Start it with: bunx the-companion`));
-      process.exit(1);
     }
+  } catch (e) {
+    console.error(
+      chalk.red(
+        `Cannot connect to Companion at ${host}. Is it running?`,
+      ),
+    );
+    console.error(chalk.dim(`Start it with: bunx the-companion`));
+    process.exit(1);
   }
 
   // Set up TUI
