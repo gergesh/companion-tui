@@ -1,0 +1,147 @@
+// WebSocket client for connecting to Companion server as a "browser" client
+
+import WebSocket from "ws"; // eslint-disable-line
+import type {
+  ClientMessage,
+  ServerMessage,
+  SessionState,
+} from "./types.ts";
+
+export type ConnectionStatus = "connecting" | "connected" | "disconnected";
+
+export interface CompanionClientOptions {
+  host: string; // e.g. "localhost:3456"
+  sessionId: string;
+  onMessage: (msg: ServerMessage) => void;
+  onStatusChange: (status: ConnectionStatus) => void;
+}
+
+export class CompanionClient {
+  private ws: WebSocket | null = null;
+  private lastSeq = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private disposed = false;
+
+  constructor(private opts: CompanionClientOptions) {}
+
+  connect(): void {
+    if (this.disposed) return;
+    this.opts.onStatusChange("connecting");
+
+    const url = `ws://${this.opts.host}/ws/browser/${this.opts.sessionId}`;
+    const ws = new WebSocket(url);
+
+    ws.on("open", () => {
+      this.opts.onStatusChange("connected");
+      this.send({ type: "session_subscribe", last_seq: this.lastSeq });
+    });
+
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString()) as ServerMessage;
+        if ("seq" in msg && typeof msg.seq === "number") {
+          this.lastSeq = msg.seq;
+        }
+        this.opts.onMessage(msg);
+      } catch {
+        // ignore unparseable messages
+      }
+    });
+
+    ws.on("close", () => {
+      this.ws = null;
+      this.opts.onStatusChange("disconnected");
+      this.scheduleReconnect();
+    });
+
+    ws.on("error", () => {
+      // error is followed by close
+    });
+
+    this.ws = ws;
+  }
+
+  send(msg: ClientMessage): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    }
+  }
+
+  sendUserMessage(content: string): void {
+    this.send({
+      type: "user_message",
+      content,
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  sendPermissionResponse(
+    requestId: string,
+    behavior: "allow" | "deny",
+  ): void {
+    this.send({
+      type: "permission_response",
+      request_id: requestId,
+      behavior,
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  interrupt(): void {
+    this.send({ type: "interrupt", client_msg_id: crypto.randomUUID() });
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.ws?.close();
+    this.ws = null;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.disposed) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.connect();
+    }, 2000);
+  }
+}
+
+// REST API helpers for session management
+export async function listSessions(
+  host: string,
+): Promise<Array<{ session_id: string; state: string; cwd: string }>> {
+  const res = await fetch(`http://${host}/api/sessions`);
+  if (!res.ok) throw new Error(`Failed to list sessions: ${res.status}`);
+  return res.json();
+}
+
+export interface CreateSessionOpts {
+  model?: string;
+  permissionMode?: string;
+  cwd?: string;
+  allowedTools?: string[];
+  env?: Record<string, string>;
+}
+
+export async function createSession(
+  host: string,
+  opts: CreateSessionOpts = {},
+): Promise<{ sessionId: string; state: string; cwd: string }> {
+  const res = await fetch(`http://${host}/api/sessions/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+  if (!res.ok) throw new Error(`Failed to create session: ${res.status}`);
+  return res.json();
+}
+
+export async function killSession(
+  host: string,
+  sessionId: string,
+): Promise<void> {
+  const res = await fetch(`http://${host}/api/sessions/${sessionId}/kill`, {
+    method: "POST",
+  });
+  if (!res.ok) throw new Error(`Failed to kill session: ${res.status}`);
+}
