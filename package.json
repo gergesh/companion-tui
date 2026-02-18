@@ -1,5 +1,5 @@
 {
-  "name": "ccpi",
+  "name": "companion-tui",
   "version": "0.1.0",
   "description": "Dual TUI + Web UI for Claude Code sessions",
   "type": "module",

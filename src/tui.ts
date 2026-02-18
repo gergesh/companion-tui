@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// ccpi TUI - Terminal client for Companion server
+// companion-tui - Terminal client for Companion server
 // Connects as a "browser" client via WebSocket to share sessions with the web UI
 
 import chalk from "chalk";
@@ -272,13 +272,13 @@ function parseCliArgs(): CliArgs {
 }
 
 function printUsage(): void {
-  console.log(`${chalk.bold("ccpi")} — TUI client for Claude Code via Companion
+  console.log(`${chalk.bold("companion-tui")} — TUI client for Claude Code via Companion
 
 ${chalk.dim("Usage:")}
-  ccpi                         Connect to a running session, or create one
-  ccpi -c                      Resume the most recent session (relaunch if exited)
-  ccpi -r                      Pick a session to resume interactively
-  ccpi -r <session-id>         Resume a specific session by ID (prefix match)
+  companion-tui                Connect to a running session, or create one
+  companion-tui -c             Resume the most recent session (relaunch if exited)
+  companion-tui -r             Pick a session to resume interactively
+  companion-tui -r <id>        Resume a specific session by ID (prefix match)
 
 ${chalk.dim("Options:")}
   -c, --continue               Resume the most recent session
@@ -515,8 +515,8 @@ async function main() {
   const slashCommands: SlashCommand[] = [
     { name: "help", description: "Show help" },
     { name: "clear", description: "Clear conversation" },
-    { name: "quit", description: "Exit ccpi" },
-    { name: "exit", description: "Exit ccpi" },
+    { name: "quit", description: "Exit companion-tui" },
+    { name: "exit", description: "Exit companion-tui" },
     { name: "mcp", description: "MCP server status" },
     { name: "model", description: "Switch model" },
     { name: "mode", description: "Switch permission mode" },
@@ -795,7 +795,7 @@ async function main() {
 
       case "session_name_update": {
         header.setText(
-          chalk.bold("ccpi") +
+          chalk.bold("companion-tui") +
             chalk.dim(` — ${msg.name}`),
         );
         tui.requestRender();
@@ -818,7 +818,7 @@ async function main() {
 
   // Build UI tree
   const header = new Text(
-    chalk.bold("ccpi") +
+    chalk.bold("companion-tui") +
       chalk.dim(` — session ${sessionId.slice(0, 8)}`),
     1,
     0,
@@ -897,7 +897,7 @@ async function main() {
       chalk.bold("Commands:"),
       `  ${chalk.cyan("/help")}          Show this help`,
       `  ${chalk.cyan("/clear")}         Clear conversation display`,
-      `  ${chalk.cyan("/quit")}          Exit ccpi`,
+      `  ${chalk.cyan("/quit")}          Exit companion-tui`,
       `  ${chalk.cyan("/compact")}       Compact conversation context`,
       `  ${chalk.cyan("/mcp")}           Show MCP server status`,
       `  ${chalk.cyan("/model [name]")}  Switch model (picker if no arg)`,

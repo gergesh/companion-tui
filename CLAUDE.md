@@ -1,4 +1,4 @@
-# ccpi - Claude Code Parallel Interface
+# companion-tui
 
 Dual TUI + Web UI for Claude Code sessions.
 
@@ -18,5 +18,5 @@ See ARCHITECTURE.md for the full analysis of approaches.
 
 ```bash
 bun install
-bun run poc/companion-tui.ts   # PoC: TUI client for Companion
+bun run src/tui.ts
 ```
