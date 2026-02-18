@@ -12,9 +12,11 @@ import {
   Spacer,
   Loader,
   SelectList,
+  CombinedAutocompleteProvider,
   matchesKey,
   type Component,
   type SelectItem,
+  type SlashCommand,
   CURSOR_MARKER,
 } from "@mariozechner/pi-tui";
 import {
@@ -31,6 +33,7 @@ import type {
   ContentBlock,
   PermissionRequest,
   SessionState,
+  McpServerDetail,
 } from "./types.ts";
 
 // -- Themes ------------------------------------------------------------------
@@ -127,6 +130,7 @@ class StatusBar implements Component {
   connectionStatus: ConnectionStatus = "disconnected";
   session: SessionState | null = null;
   isRunning = false;
+  gitBranch: string | null = null;
 
   invalidate(): void {}
 
@@ -144,6 +148,12 @@ class StatusBar implements Component {
 
     if (this.session) {
       parts.push(chalk.dim(this.session.model));
+      if (
+        this.session.permissionMode &&
+        this.session.permissionMode !== "default"
+      ) {
+        parts.push(chalk.magenta(this.session.permissionMode));
+      }
       if (this.session.total_cost_usd > 0) {
         parts.push(
           chalk.dim(`$${this.session.total_cost_usd.toFixed(4)}`),
@@ -156,8 +166,13 @@ class StatusBar implements Component {
       }
     }
 
+    if (this.gitBranch) {
+      parts.push(chalk.dim(`⎇ ${this.gitBranch}`));
+    }
+
     if (this.isRunning) {
       parts.push(chalk.cyan("⟳ running"));
+      parts.push(chalk.dim("ESC to interrupt"));
     }
 
     const line = parts.join(chalk.dim(" │ "));
@@ -496,11 +511,44 @@ async function main() {
   const statusBar = new StatusBar();
   const editor = new Editor(tui, editorTheme);
 
+  // Set up slash command autocomplete
+  const slashCommands: SlashCommand[] = [
+    { name: "help", description: "Show help" },
+    { name: "clear", description: "Clear conversation" },
+    { name: "quit", description: "Exit ccpi" },
+    { name: "exit", description: "Exit ccpi" },
+    { name: "mcp", description: "MCP server status" },
+    { name: "model", description: "Switch model" },
+    { name: "mode", description: "Switch permission mode" },
+    { name: "status", description: "Show session info" },
+    { name: "compact", description: "Compact context" },
+  ];
+  editor.setAutocompleteProvider(
+    new CombinedAutocompleteProvider(slashCommands),
+  );
+
+  // Detect git branch
+  try {
+    const proc = Bun.spawnSync(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd: process.cwd(),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (proc.exitCode === 0) {
+      statusBar.gitBranch = proc.stdout.toString().trim();
+    }
+  } catch {
+    // not a git repo or git not available
+  }
+
   // Streaming state
   let streamingText = "";
   let streamingMd: Markdown | null = null;
   let loader: Loader | null = null;
   let permissionBanner: PermissionBanner | null = null;
+
+  // Track whether the current run was triggered by us or by another client (web UI)
+  let locallyTriggered = false;
 
   // Insert a component before the editor (which is always last)
   function insertBeforeEditor(component: Component): void {
@@ -555,9 +603,12 @@ async function main() {
       }
 
       case "user_message": {
-        // Show user messages (could be from web UI)
+        // Skip our own echoes; show messages from other clients
+        if (msg.sender_client_id === client.clientId) break;
+        // Show messages from other clients (web UI) or history replay
+        const label = chalk.magenta("Web: ");
         const userMd = new Markdown(
-          chalk.blue("You: ") + msg.content,
+          label + msg.content,
           1,
           0,
           markdownTheme,
@@ -608,6 +659,7 @@ async function main() {
         removeLoader();
         statusBar.isRunning = false;
         editor.disableSubmit = false;
+        locallyTriggered = false;
         if (permissionBanner) {
           tui.removeChild(permissionBanner);
           permissionBanner = null;
@@ -683,7 +735,28 @@ async function main() {
       }
 
       case "status_change": {
-        statusBar.isRunning = msg.status === "running";
+        const nowRunning = msg.status === "running";
+        statusBar.isRunning = nowRunning;
+
+        if (nowRunning && !locallyTriggered) {
+          // Another client (web UI) triggered a run
+          editor.disableSubmit = true;
+          const notice = new Text(
+            chalk.dim.italic("  [input from web UI]"),
+            0,
+            0,
+          );
+          insertBeforeEditor(notice);
+          loader = new Loader(
+            tui,
+            (s) => chalk.cyan(s),
+            (s) => chalk.dim(s),
+            "Thinking...",
+          );
+          insertBeforeEditor(loader);
+          loader.start();
+        }
+
         if (msg.status === "compacting") {
           if (loader) loader.setMessage("Compacting context...");
         }
@@ -720,6 +793,20 @@ async function main() {
         break;
       }
 
+      case "session_name_update": {
+        header.setText(
+          chalk.bold("ccpi") +
+            chalk.dim(` — ${msg.name}`),
+        );
+        tui.requestRender();
+        break;
+      }
+
+      case "mcp_status": {
+        renderMcpStatus(msg.servers);
+        break;
+      }
+
       case "error": {
         const errText = new Text(chalk.red(`Error: ${msg.message}`), 1, 0);
         insertBeforeEditor(errText);
@@ -728,6 +815,19 @@ async function main() {
       }
     }
   }
+
+  // Build UI tree
+  const header = new Text(
+    chalk.bold("ccpi") +
+      chalk.dim(` — session ${sessionId.slice(0, 8)}`),
+    1,
+    0,
+  );
+  tui.addChild(statusBar);
+  tui.addChild(header);
+  tui.addChild(new Spacer(1));
+  tui.addChild(editor);
+  tui.setFocus(editor);
 
   // Set up Companion WebSocket client
   const client = new CompanionClient({
@@ -740,13 +840,351 @@ async function main() {
     },
   });
 
+  // -- Local slash commands ----------------------------------------------------
+
+  function handleSlashCommand(cmd: string): boolean {
+    const parts = cmd.split(/\s+/);
+    const name = parts[0]!.toLowerCase();
+    const arg = parts.slice(1).join(" ").trim();
+
+    if (name === "/quit" || name === "/exit") {
+      cleanup();
+      return true;
+    }
+    if (name === "/clear") {
+      clearConversation();
+      return true;
+    }
+    if (name === "/help") {
+      showHelp();
+      return true;
+    }
+    if (name === "/mcp") {
+      showMcp();
+      return true;
+    }
+    if (name === "/model") {
+      showModelPicker(arg || null);
+      return true;
+    }
+    if (name === "/mode") {
+      showModePicker(arg || null);
+      return true;
+    }
+    if (name === "/status") {
+      showStatus();
+      return true;
+    }
+    // Everything else (e.g. /compact) goes to the CLI as a user message
+    return false;
+  }
+
+  function clearConversation(): void {
+    // Remove everything between the header and the editor
+    const keep = new Set<Component>([statusBar, header, editor]);
+    const toRemove = tui.children.filter((c) => !keep.has(c));
+    for (const c of toRemove) {
+      if (c instanceof Loader) c.stop();
+      tui.removeChild(c);
+    }
+    // Re-add spacer between header and editor
+    insertBeforeEditor(new Spacer(1));
+    tui.requestRender();
+  }
+
+  function showHelp(): void {
+    const helpText = [
+      chalk.bold("Commands:"),
+      `  ${chalk.cyan("/help")}          Show this help`,
+      `  ${chalk.cyan("/clear")}         Clear conversation display`,
+      `  ${chalk.cyan("/quit")}          Exit ccpi`,
+      `  ${chalk.cyan("/compact")}       Compact conversation context`,
+      `  ${chalk.cyan("/mcp")}           Show MCP server status`,
+      `  ${chalk.cyan("/model [name]")}  Switch model (picker if no arg)`,
+      `  ${chalk.cyan("/mode [name]")}   Switch permission mode (picker if no arg)`,
+      `  ${chalk.cyan("/status")}        Show session info`,
+      "",
+      chalk.bold("Keys:"),
+      `  ${chalk.cyan("Esc")}            Interrupt current operation`,
+      `  ${chalk.cyan("Ctrl+C")}         Interrupt, or exit if idle (2x to force)`,
+      `  ${chalk.cyan("Enter")}          Send message`,
+      "",
+      chalk.dim("Other slash commands are forwarded to the Claude Code CLI."),
+    ].join("\n");
+    const helpMd = new Text(helpText, 1, 0);
+    insertBeforeEditor(helpMd);
+    insertBeforeEditor(new Spacer(1));
+    tui.requestRender();
+  }
+
+  // -- /mcp command -----------------------------------------------------------
+
+  // Tracks the last MCP status response for interactive toggle/reconnect
+  let lastMcpServers: McpServerDetail[] = [];
+
+  function showMcp(): void {
+    client.mcpGetStatus();
+    const notice = new Text(chalk.dim("Fetching MCP server status..."), 1, 0);
+    insertBeforeEditor(notice);
+    tui.requestRender();
+  }
+
+  function renderMcpStatus(servers: McpServerDetail[]): void {
+    lastMcpServers = servers;
+    if (servers.length === 0) {
+      const notice = new Text(chalk.dim("No MCP servers configured."), 1, 0);
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+      return;
+    }
+
+    const lines: string[] = [chalk.bold("MCP Servers:")];
+    for (let i = 0; i < servers.length; i++) {
+      const s = servers[i]!;
+      const dot =
+        s.status === "connected"
+          ? chalk.green("●")
+          : s.status === "connecting"
+            ? chalk.yellow("●")
+            : s.status === "disabled"
+              ? chalk.dim("○")
+              : chalk.red("●");
+      const toolCount = s.tools?.length ?? 0;
+      const toolsLabel = toolCount > 0 ? chalk.dim(` (${toolCount} tools)`) : "";
+      lines.push(
+        `  ${chalk.dim(`${i + 1}.`)} ${dot} ${chalk.bold(s.name)} ${chalk.dim(s.config.type)}${toolsLabel}`,
+      );
+      if (s.error) {
+        lines.push(`     ${chalk.red(s.error)}`);
+      }
+    }
+    lines.push("");
+    lines.push(
+      chalk.dim(
+        "  Type number + t to toggle, number + r to reconnect (e.g. 1t, 2r)",
+      ),
+    );
+
+    const mcpText = new Text(lines.join("\n"), 1, 0);
+    insertBeforeEditor(mcpText);
+    insertBeforeEditor(new Spacer(1));
+    tui.requestRender();
+  }
+
+  // -- /model command --------------------------------------------------------
+
+  function showModelPicker(directArg: string | null): void {
+    if (directArg) {
+      client.setModel(directArg);
+      const notice = new Text(
+        chalk.dim(`Switching model to ${chalk.bold(directArg)}...`),
+        1,
+        0,
+      );
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+      return;
+    }
+
+    const items: SelectItem[] = [
+      {
+        label: "claude-sonnet-4-6",
+        value: "claude-sonnet-4-6",
+        description: "Fast, balanced",
+      },
+      {
+        label: "claude-opus-4-6",
+        value: "claude-opus-4-6",
+        description: "Most capable",
+      },
+      {
+        label: "claude-haiku-4-5",
+        value: "claude-haiku-4-5",
+        description: "Quick, lightweight",
+      },
+    ];
+
+    const list = new SelectList(items, items.length, selectListTheme);
+    insertBeforeEditor(list);
+    tui.setFocus(list);
+
+    list.onSelect = (item: SelectItem) => {
+      tui.removeChild(list);
+      tui.setFocus(editor);
+      client.setModel(item.value);
+      const notice = new Text(
+        chalk.dim(`Switching model to ${chalk.bold(item.value)}...`),
+        1,
+        0,
+      );
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+    };
+
+    list.onCancel = () => {
+      tui.removeChild(list);
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+
+    tui.requestRender();
+  }
+
+  // -- /mode command ---------------------------------------------------------
+
+  function showModePicker(directArg: string | null): void {
+    if (directArg) {
+      client.setPermissionMode(directArg);
+      const notice = new Text(
+        chalk.dim(`Switching permission mode to ${chalk.bold(directArg)}...`),
+        1,
+        0,
+      );
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+      return;
+    }
+
+    const items: SelectItem[] = [
+      {
+        label: "default",
+        value: "default",
+        description: "Ask for permissions",
+      },
+      {
+        label: "plan",
+        value: "plan",
+        description: "Read-only, no writes",
+      },
+      {
+        label: "bypassPermissions",
+        value: "bypassPermissions",
+        description: "Skip all permission checks",
+      },
+    ];
+
+    const list = new SelectList(items, items.length, selectListTheme);
+    insertBeforeEditor(list);
+    tui.setFocus(list);
+
+    list.onSelect = (item: SelectItem) => {
+      tui.removeChild(list);
+      tui.setFocus(editor);
+      client.setPermissionMode(item.value);
+      const notice = new Text(
+        chalk.dim(`Switching mode to ${chalk.bold(item.value)}...`),
+        1,
+        0,
+      );
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+    };
+
+    list.onCancel = () => {
+      tui.removeChild(list);
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+
+    tui.requestRender();
+  }
+
+  // -- /status command -------------------------------------------------------
+
+  function showStatus(): void {
+    const s = statusBar.session;
+    if (!s) {
+      const notice = new Text(
+        chalk.dim("No session info available yet."),
+        1,
+        0,
+      );
+      insertBeforeEditor(notice);
+      insertBeforeEditor(new Spacer(1));
+      tui.requestRender();
+      return;
+    }
+
+    const lines: string[] = [chalk.bold("Session Status:")];
+    lines.push(`  Model:       ${chalk.cyan(s.model)}`);
+    lines.push(`  Mode:        ${chalk.magenta(s.permissionMode)}`);
+    lines.push(`  Cost:        ${chalk.yellow(`$${s.total_cost_usd.toFixed(4)}`)}`);
+    lines.push(`  Context:     ${s.context_used_percent}%`);
+    lines.push(`  Turns:       ${s.num_turns}`);
+    lines.push(`  CWD:         ${chalk.dim(s.cwd)}`);
+    if (statusBar.gitBranch) {
+      lines.push(`  Git branch:  ${chalk.dim(statusBar.gitBranch)}`);
+    }
+    if (s.mcp_servers.length > 0) {
+      lines.push(`  MCP servers: ${s.mcp_servers.length}`);
+    }
+    lines.push(`  Version:     ${chalk.dim(s.claude_code_version)}`);
+
+    const statusText = new Text(lines.join("\n"), 1, 0);
+    insertBeforeEditor(statusText);
+    insertBeforeEditor(new Spacer(1));
+    tui.requestRender();
+  }
+
+  function cleanup(): void {
+    client.dispose();
+    tui.stop();
+    process.exit(0);
+  }
+
   // Wire up editor submit
   editor.onSubmit = (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+
+    // Handle local slash commands
+    if (trimmed.startsWith("/") && handleSlashCommand(trimmed)) {
+      return;
+    }
+
+    // Handle MCP toggle/reconnect (e.g. "1t", "2r")
+    const mcpAction = trimmed.match(/^(\d+)([tr])$/i);
+    if (mcpAction && lastMcpServers.length > 0) {
+      const idx = parseInt(mcpAction[1]!, 10) - 1;
+      const action = mcpAction[2]!.toLowerCase();
+      const server = lastMcpServers[idx];
+      if (server) {
+        if (action === "t") {
+          const nowEnabled = server.status !== "disabled";
+          client.mcpToggle(server.name, !nowEnabled);
+          const verb = nowEnabled ? "Disabling" : "Enabling";
+          const notice = new Text(
+            chalk.dim(`${verb} ${chalk.bold(server.name)}...`),
+            1,
+            0,
+          );
+          insertBeforeEditor(notice);
+          // Refresh status after a short delay
+          setTimeout(() => client.mcpGetStatus(), 500);
+        } else {
+          client.mcpReconnect(server.name);
+          const notice = new Text(
+            chalk.dim(`Reconnecting ${chalk.bold(server.name)}...`),
+            1,
+            0,
+          );
+          insertBeforeEditor(notice);
+          setTimeout(() => client.mcpGetStatus(), 1000);
+        }
+        tui.requestRender();
+        return;
+      }
+    }
+
     if (statusBar.isRunning) return;
 
     // Send to Companion
+    locallyTriggered = true;
     client.sendUserMessage(trimmed);
 
     // Show user message in TUI
@@ -773,31 +1211,34 @@ async function main() {
   };
 
   // Global keybindings
+  let lastCtrlC = 0;
+
   tui.addInputListener((data) => {
-    if (matchesKey(data, "ctrl+c")) {
+    // ESC: interrupt if running
+    if (matchesKey(data, "escape")) {
       if (statusBar.isRunning) {
         client.interrupt();
         return { consume: true };
       }
-      client.dispose();
-      tui.stop();
-      process.exit(0);
+      return undefined; // let editor handle it (e.g. close autocomplete)
+    }
+
+    // Ctrl+C: interrupt if running, exit if idle, force exit on double-tap
+    if (matchesKey(data, "ctrl+c")) {
+      const now = Date.now();
+      if (statusBar.isRunning) {
+        // Double Ctrl+C within 500ms: force exit even while running
+        if (now - lastCtrlC < 500) {
+          cleanup();
+        }
+        lastCtrlC = now;
+        client.interrupt();
+        return { consume: true };
+      }
+      cleanup();
     }
     return undefined;
   });
-
-  // Build UI tree
-  const header = new Text(
-    chalk.bold("ccpi") +
-      chalk.dim(` — session ${sessionId.slice(0, 8)}`),
-    1,
-    0,
-  );
-  tui.addChild(statusBar);
-  tui.addChild(header);
-  tui.addChild(new Spacer(1));
-  tui.addChild(editor);
-  tui.setFocus(editor);
 
   // Connect and start
   client.connect();

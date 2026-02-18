@@ -21,6 +21,7 @@ export class CompanionClient {
   private lastSeq = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+  readonly clientId = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   constructor(private opts: CompanionClientOptions) {}
 
@@ -33,7 +34,7 @@ export class CompanionClient {
 
     ws.on("open", () => {
       this.opts.onStatusChange("connected");
-      this.send({ type: "session_subscribe", last_seq: this.lastSeq });
+      this.send({ type: "session_subscribe", last_seq: this.lastSeq, client_id: this.clientId });
     });
 
     ws.on("message", (data) => {
@@ -89,6 +90,46 @@ export class CompanionClient {
 
   interrupt(): void {
     this.send({ type: "interrupt", client_msg_id: crypto.randomUUID() });
+  }
+
+  setModel(model: string): void {
+    this.send({
+      type: "set_model",
+      model,
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  setPermissionMode(mode: string): void {
+    this.send({
+      type: "set_permission_mode",
+      mode,
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  mcpGetStatus(): void {
+    this.send({
+      type: "mcp_get_status",
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  mcpToggle(serverName: string, enabled: boolean): void {
+    this.send({
+      type: "mcp_toggle",
+      serverName,
+      enabled,
+      client_msg_id: crypto.randomUUID(),
+    });
+  }
+
+  mcpReconnect(serverName: string): void {
+    this.send({
+      type: "mcp_reconnect",
+      serverName,
+      client_msg_id: crypto.randomUUID(),
+    });
   }
 
   dispose(): void {

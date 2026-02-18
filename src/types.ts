@@ -120,6 +120,7 @@ export type ServerMessage =
       content: string;
       timestamp: number;
       id?: string;
+      sender_client_id?: string;
       seq?: number;
     }
   | {
@@ -132,7 +133,8 @@ export type ServerMessage =
       events: Array<{ msg: ServerMessage; seq: number }>;
       seq?: number;
     }
-  | { type: "session_name_update"; name: string; seq?: number };
+  | { type: "session_name_update"; name: string; seq?: number }
+  | { type: "mcp_status"; servers: McpServerDetail[]; seq?: number };
 
 // Stream events (from Anthropic API, proxied through CLI)
 export type StreamEvent =
@@ -160,6 +162,24 @@ export type StreamEvent =
   | { type: "message_delta"; delta: { stop_reason: string } }
   | { type: "message_stop" };
 
+// MCP server detail (returned by mcp_status)
+export interface McpServerDetail {
+  name: string;
+  status: "connected" | "failed" | "disabled" | "connecting";
+  serverInfo?: unknown;
+  error?: string;
+  config: { type: string; url?: string; command?: string; args?: string[] };
+  scope: string;
+  tools?: {
+    name: string;
+    annotations?: {
+      readOnly?: boolean;
+      destructive?: boolean;
+      openWorld?: boolean;
+    };
+  }[];
+}
+
 // Messages FROM browser/TUI clients TO Companion server
 export type ClientMessage =
   | {
@@ -176,7 +196,7 @@ export type ClientMessage =
       updated_input?: Record<string, unknown>;
       client_msg_id?: string;
     }
-  | { type: "session_subscribe"; last_seq: number }
+  | { type: "session_subscribe"; last_seq: number; client_id?: string }
   | { type: "session_ack"; last_seq: number }
   | { type: "interrupt"; client_msg_id?: string }
   | { type: "set_model"; model: string; client_msg_id?: string }
@@ -184,4 +204,12 @@ export type ClientMessage =
       type: "set_permission_mode";
       mode: string;
       client_msg_id?: string;
-    };
+    }
+  | { type: "mcp_get_status"; client_msg_id?: string }
+  | {
+      type: "mcp_toggle";
+      serverName: string;
+      enabled: boolean;
+      client_msg_id?: string;
+    }
+  | { type: "mcp_reconnect"; serverName: string; client_msg_id?: string };
